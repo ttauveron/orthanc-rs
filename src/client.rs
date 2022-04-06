@@ -12,6 +12,12 @@ use std::convert::TryFrom;
 use std::io::prelude::*;
 use std::str;
 use std::time;
+use std::fs;
+use std::time::{SystemTime, UNIX_EPOCH};
+use openssl::hash::MessageDigest;
+use openssl::pkey::PKey;
+use openssl::rsa::Rsa;
+use openssl::sign::Signer;
 
 /// Client type
 ///
@@ -40,6 +46,8 @@ pub struct Client {
     server: String,
     username: Option<String>,
     password: Option<String>,
+    iap_client_id: Option<String>,
+    google_application_credentials: Option<String>,
     client: reqwest::blocking::Client,
 }
 
@@ -59,6 +67,8 @@ impl Client {
             server: server.into(),
             username: None,
             password: None,
+            iap_client_id: None,
+            google_application_credentials: None,
             client,
         }
     }
@@ -78,14 +88,89 @@ impl Client {
         self
     }
 
+    pub fn google_oidc(
+        mut self,
+        iap_client_id: impl Into<String>,
+        google_application_credentials: impl Into<String>,
+    ) -> Client {
+        self.iap_client_id = Some(iap_client_id.into());
+        self.google_application_credentials = Some(google_application_credentials.into());
+        self
+    }
+
     fn add_auth(
         &self,
         request: reqwest::blocking::RequestBuilder,
     ) -> reqwest::blocking::RequestBuilder {
-        match (&self.username, &self.password) {
+        let request = match (&self.username, &self.password) {
             (Some(u), Some(p)) => request.basic_auth(u, Some(p)),
             _ => request,
-        }
+        };
+        let request = match (&self.iap_client_id, &self.google_application_credentials) {
+            (Some(id), Some(sa)) => {
+                return request.bearer_auth(
+                    self.get_google_token(
+                        id.to_string(),
+                        sa.to_string()));
+            }
+            _ => request,
+        };
+        return request;
+    }
+    /// Get the bearer token in exchange for the service account credentials.
+    fn get_google_token(&self,
+                        iap_client_id: String,
+                        google_application_credentials: String) -> String {
+        let service_account_key_file_path = google_application_credentials;
+        let iap_client_id = iap_client_id;
+        let _iam_scope = "https://www.googleapis.com/auth/iam";
+        let oauth_token_uri = "https://www.googleapis.com/oauth2/v4/token";
+
+        let sa_file = fs::read_to_string(service_account_key_file_path).unwrap();
+
+        let sa_json: serde_json::Value = serde_json::from_str(&*sa_file).unwrap();
+        let private_key_id = sa_json["private_key_id"].as_str().unwrap();
+        let client_email = sa_json["client_email"].as_str().unwrap();
+        let private_key = sa_json["private_key"].as_str().unwrap().replace("\\n", "\n");
+
+        let issued_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let expires_at = issued_at + 3600;
+        let header = format!("{{'alg':'RS256','typ':'JWT','kid':'{private_key_id}'}}");
+        let header_base64 = base64::encode(header);
+        let payload = format!("{{\
+                                        'iss':'{client_email}',\
+                                        'aud':'{oauth_token_uri}',\
+                                        'exp':{expires_at},\
+                                        'iat':{issued_at},\
+                                        'sub':'{client_email}',\
+                                        'target_audience':'{iap_client_id}'\
+                                    }}");
+        let payload_base64 = base64::encode(payload);
+
+        let data = format!("{header_base64}.{payload_base64}");
+        let keypair = Rsa::private_key_from_pem(private_key.as_bytes()).unwrap();
+        let keypair = PKey::from_rsa(keypair).unwrap();
+        let mut signer = Signer::new(MessageDigest::sha256(), &keypair).unwrap();
+        signer.update(data.as_ref()).unwrap();
+        let signature = signer.sign_to_vec().unwrap();
+        let signature_base64 = base64::encode(signature);
+
+        let assertion = format!("{header_base64}.{payload_base64}.{signature_base64}");
+        let token_payload = self.client.post("https://www.googleapis.com/oauth2/v4/token")
+            .form(&[
+                ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+                ("assertion", &assertion)
+            ])
+            .send()
+            .unwrap()
+            .text()
+            .unwrap();
+
+        let token: serde_json::Value = serde_json::from_str(&*token_payload).unwrap();
+        return format!("{}", token["id_token"].as_str().unwrap());
     }
 
     ////////// HTTP //////////
@@ -257,7 +342,7 @@ impl Client {
             &format!("modalities/{}", name),
             serde_json::to_value(modality)?,
         )
-        .map(|_| ())
+            .map(|_| ())
     }
 
     /// Modify a modality
@@ -266,7 +351,7 @@ impl Client {
             &format!("modalities/{}", name),
             serde_json::to_value(modality)?,
         )
-        .map(|_| ())
+            .map(|_| ())
     }
 
     /// Delete a modality
@@ -286,7 +371,7 @@ impl Client {
             &format!("modalities/{}/echo", modality),
             Some(serde_json::json!(data)),
         )
-        .map(|_| ())
+            .map(|_| ())
     }
 
     /// Send a C-ECHO request to a remote modality
@@ -331,7 +416,7 @@ impl Client {
             &format!("modalities/{}/move", modality),
             Some(serde_json::to_value(move_request)?),
         )
-        .map(|_| ())
+            .map(|_| ())
     }
 
     /// Send a C-FIND request to a remote modality
@@ -800,7 +885,7 @@ impl Client {
                 })
             }),
         )
-        .map(|_| ())
+            .map(|_| ())
     }
 
     /// Retrieve all query answers
@@ -813,7 +898,7 @@ impl Client {
                 })
             }),
         )
-        .map(|_| ())
+            .map(|_| ())
     }
 
     ////////// Orther //////////
@@ -1066,7 +1151,7 @@ mod tests {
                     http_error: "Bad Request".to_string(),
                     orthanc_status: 15,
                     orthanc_error: "Bad file format".to_string(),
-                },),
+                }, ),
             },
         );
         assert_eq!(m.times_called(), 1);
@@ -1116,7 +1201,7 @@ mod tests {
                     http_error: "Bad Request".to_string(),
                     orthanc_status: 15,
                     orthanc_error: "Bad file format".to_string(),
-                },),
+                }, ),
             },
         );
         assert_eq!(m.times_called(), 1);
@@ -1190,7 +1275,7 @@ mod tests {
                     http_error: "Bad Request".to_string(),
                     orthanc_status: 15,
                     orthanc_error: "Bad file format".to_string(),
-                },),
+                }, ),
             },
         );
         assert_eq!(m.times_called(), 1);
@@ -1240,7 +1325,7 @@ mod tests {
                     http_error: "Bad Request".to_string(),
                     orthanc_status: 15,
                     orthanc_error: "Bad file format".to_string(),
-                },),
+                }, ),
             },
         );
         assert_eq!(m.times_called(), 1);
@@ -1314,7 +1399,7 @@ mod tests {
                     http_error: "Bad Request".to_string(),
                     orthanc_status: 15,
                     orthanc_error: "Bad file format".to_string(),
-                },),
+                }, ),
             },
         );
         assert_eq!(m.times_called(), 1);
@@ -1385,7 +1470,7 @@ mod tests {
                     http_error: "Bad Request".to_string(),
                     orthanc_status: 15,
                     orthanc_error: "Bad file format".to_string(),
-                },),
+                }, ),
             },
         );
         assert_eq!(m.times_called(), 1);
@@ -1434,7 +1519,7 @@ mod tests {
                     http_error: "Bad Request".to_string(),
                     orthanc_status: 15,
                     orthanc_error: "Bad file format".to_string(),
-                },),
+                }, ),
             },
         );
         assert_eq!(m.times_called(), 1);
@@ -1530,7 +1615,7 @@ mod tests {
                 id: "86a3054b-32bb888a-e5f42e28-4b2e82d2-b1d7e14c".to_string(),
                 patient_id: "86a3054b-32bb888a-e5f42e28-4b2e82d2-b1d7e14c".to_string(),
                 path: "/studies/86a3054b-32bb888a-e5f42e28-4b2e82d2-b1d7e14c".to_string(),
-                entity: EntityKind::Study
+                entity: EntityKind::Study,
             }
         );
         assert_eq!(m.times_called(), 1);
